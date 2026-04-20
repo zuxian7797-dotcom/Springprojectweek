@@ -1,1 +1,65 @@
 
+import RPi.GPIO as GPIO
+from time import sleep
+
+# --- PIN CONFIGURATION ---
+ENA, IN1, IN2 = 18,17,27 
+ENB, IN3, IN4 = 24,22,23
+
+# --- SETUP ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup([ENA, IN1, IN2, ENB, IN3, IN4], GPIO.OUT)
+
+# Initialize PWM at 100Hz
+pwm_left = GPIO.PWM(ENA, 100)
+pwm_right = GPIO.PWM(ENB, 100)
+pwm_left.start(0)
+pwm_right.start(0)
+
+def set_motors(left_speed, right_speed, left_mode, right_mode):    
+    if left_mode == 1:
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+    elif left_mode == -1:
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH)
+    
+    if right_mode == 1:
+        GPIO.output(IN3, GPIO.HIGH)
+        GPIO.output(IN4, GPIO.LOW)
+    elif right_mode == -1:
+        GPIO.output(IN3, GPIO.LOW)
+        GPIO.output(IN4, GPIO.HIGH)
+
+    pwm_left.ChangeDutyCycle(left_speed)
+    pwm_right.ChangeDutyCycle(right_speed)
+
+def run_test():    
+    try:
+        while True:
+            direction = input("Enter what the robot movement: ")
+            speed = int(input("enter the speed: (0 - 100):"))
+            time = float(input("enter time:"))
+
+            if direction == 'f':
+                set_motors(speed, speed, 1, 1)
+            elif direction == 'b':
+                set_motors(speed, speed, -1, -1)
+            elif direction == 'l':
+                set_motors(speed, speed, 1, -1)
+            elif direction == 'r':
+                set_motors(speed, speed, -1, 1) 
+            
+            sleep(time)
+            set_motors(0, 0, 0, 0)
+            
+    except ValueError:
+        print("Error: Please enter a number for speed")
+    finally:
+        pwm_left.stop()
+        pwm_right.stop()
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    run_test()
