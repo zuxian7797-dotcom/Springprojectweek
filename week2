@@ -1,1 +1,159 @@
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+from picamera2 import Picamera2
+import time
 
+ENA, IN1, IN2 = 18,17,27 
+ENB, IN3, IN4 = 24,22,23
+
+# Speed Settings (0 to 100)
+BASE_SPEED = 45      # Standard forward speed
+MAX_SPEED = 100       # Cap the speed for safety
+TURN_SENSITIVITY = 0.5 # How sharply it turns (Kp). Increase if it reacts too slowly.
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# Setup Pins
+motor_pins = [ENA, IN1, IN2, ENB, IN3, IN4]
+for pin in motor_pins:
+    GPIO.setup(pin, GPIO.OUT)
+
+# Setup PWM
+pwm_left = GPIO.PWM(ENA, 1000)  # 1kHz frequency
+pwm_right = GPIO.PWM(ENB, 1000)
+pwm_left.start(0)
+pwm_right.start(0)
+
+def set_motor_speed(left, right):
+    """
+    Controls motor speed and direction.
+    Args: left (int -100 to 100), right (int -100 to 100)
+    """
+    # --- LEFT MOTOR ---
+    if left >= 0: # Forward (IN1 HIGH, IN2 LOW)
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH)
+    else:         # Backward
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+    pwm_left.ChangeDutyCycle(abs(left))
+
+    # --- RIGHT MOTOR ---
+    if right >= 0: # Forward (IN3 HIGH, IN4 LOW)
+        GPIO.output(IN3, GPIO.LOW)
+        GPIO.output(IN4, GPIO.HIGH)
+    else:          # Backward
+        GPIO.output(IN3, GPIO.HIGH)
+        GPIO.output(IN4, GPIO.LOW)
+    pwm_right.ChangeDutyCycle(abs(right))
+
+def stop_motors():
+    set_motor_speed(0, 0)
+
+# --- 2. CAMERA SETUP ---
+picam2 = Picamera2()
+# Lower resolution (320x240) is faster and better for line following
+config = picam2.create_preview_configuration(main={"size": (320, 240), "format": "RGB888"})
+picam2.configure(config)
+picam2.start()
+
+print("Line Follower Active! Press 'q' to stop.")
+
+try:
+    while True:
+        # 1. Capture Frame
+        frame = picam2.capture_array()
+        
+        # 2. Crop to the bottom part (Region of Interest)
+        # We only care about the floor right in front of the robot
+        height, width, _ = frame.shape
+        roi = frame[height-80:height, :] # Take the bottom 80 pixels
+        
+        # 3. Image Processing
+        # Convert to Grayscale
+        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+        
+        # Blur to remove noise (cracks in floor)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Threshold: Find BLACK line
+        # THRESH_BINARY_INV means: Dark pixels (line) become 255 (White), Light pixels become 0 (Black)
+        # Adjust '60' based on your lighting (Lower if room is dark, Higher if bright)
+        _, thresh = cv2.threshold(blurred, 60, 255, cv2.THRESH_BINARY_INV)
+        
+        # 4. Find the Center of the Line (Centroid)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            # Find the biggest blob (the line)
+            largest_contour = max(contours, key=cv2.contourArea)
+            
+            # Calculate Moments
+            M = cv2.moments(largest_contour)
+            
+            if M['m00'] > 0:
+                # cx is the X-position of the line center
+                cx = int(M['m10'] / M['m00'])
+                
+                # Draw for debugging
+                cv2.drawContours(roi, [largest_contour], -1, (0, 255, 0), 2)
+                cv2.circle(roi, (cx, 40), 5, (255, 0, 0), -1)
+                
+                # --- 5. CONTROL LOGIC (Steering) ---
+                # Calculate Error: How far is the line from the center of the screen?
+                center_of_screen = width // 2
+                error = cx - center_of_screen
+                
+                # Determine correction amount
+                # If error is positive (Line is Right), we turn Right
+                correction = int(error * TURN_SENSITIVITY)
+                
+                left_speed = BASE_SPEED + correction
+                right_speed = BASE_SPEED - correction
+                
+                # Constrain speeds to safe limits (-MAX to MAX)
+                left_speed = max(min(left_speed, MAX_SPEED), -MAX_SPEED)
+                right_speed = max(min(right_speed, MAX_SPEED), -MAX_SPEED)
+                print(correction)
+                print("left"+ str(left_speed))
+                print("right" + str(right_speed))
+                set_motor_speed(left_speed, right_speed)
+        
+                
+        else:
+            # No line detected? STOP immediately
+            if correction >0:
+                left_speed = 100
+                right_speed = -20
+                print("right")
+            else:
+                right_speed = 100
+                left_speed = -20
+                print("left")
+
+            print("Line Lost!")
+            set_motor_speed(left_speed, right_speed)
+
+
+
+        # Show the "Vision" (ROI only)
+        cv2.imshow("Robot Eye", roi)
+        
+        # Show Threshold view (Useful for tuning sensitivity)
+        cv2.imshow("Threshold (White=Line)", thresh)
+
+        if cv2.waitKey(1) == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    stop_motors()
+    pwm_left.stop()
+    pwm_right.stop()
+    GPIO.cleanup()
+    picam2.stop()
+    cv2.destroyAllWindows()
