@@ -1,0 +1,234 @@
+import time
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import threading
+import json
+from picamera2 import Picamera2
+from flask import Flask, Response
+
+# ==========================================
+# 1. GPIO & Motor Configuration
+# ==========================================
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+ENA, IN1, IN2 = 18, 17, 27 
+ENB, IN3, IN4 = 24, 22, 23
+SERVO_PIN = 21  
+
+GPIO.setup([IN1, IN2, IN3, IN4, ENA, ENB], GPIO.OUT)
+pwm_a = GPIO.PWM(ENA, 100)
+pwm_b = GPIO.PWM(ENB, 100)
+pwm_a.start(0)
+pwm_b.start(0)
+
+# --- GLOBALS FOR SMART TURNING ---
+is_maneuvering = False
+robot_state = "running"
+pending_turn = None      
+line_detected = False     
+current_cx = 160         
+
+BASE_SPEED, TURN_SPEED = 22, 50
+
+# --- NEW: Log Storage System ---
+pi_logs = []
+
+def log_msg(message):
+    print(message) # Still print on the Pi's terminal
+    pi_logs.append(message) # Save for the Mac to fetch
+
+def set_motor_speed(left, right):
+    if left >= 0:
+        GPIO.output(IN1, GPIO.LOW); GPIO.output(IN2, GPIO.HIGH)
+    else:
+        GPIO.output(IN1, GPIO.HIGH); GPIO.output(IN2, GPIO.LOW)
+    pwm_a.ChangeDutyCycle(min(abs(left), 100))
+    if right >= 0:
+        GPIO.output(IN3, GPIO.LOW); GPIO.output(IN4, GPIO.HIGH)
+    else:
+        GPIO.output(IN3, GPIO.HIGH); GPIO.output(IN4, GPIO.LOW)
+    pwm_b.ChangeDutyCycle(min(abs(right), 100))
+
+# ==========================================
+# 2. Maneuver Logic (VISION ASSISTED)
+# ==========================================
+def execute_maneuver(action):
+    global is_maneuvering, robot_state
+    is_maneuvering = True
+    log_msg(f"\n[!!!] PI EXECUTING: {action} [!!!]")
+    
+    if action == "stop_for_auth":
+        set_motor_speed(0, 0)
+        robot_state = "stop_for_auth"
+        return 
+
+    elif action == "stop_2s" or action == "stop":
+        set_motor_speed(0, 0)
+        time.sleep(2.0)
+    elif action == "spin_360":
+        set_motor_speed(-90, 90) 
+        time.sleep(1.5) 
+        set_motor_speed(0, 0)
+        
+    elif action == "turn_left":
+        set_motor_speed(BASE_SPEED, BASE_SPEED)
+        time.sleep(0.3)
+        set_motor_speed(-TURN_SPEED, TURN_SPEED)
+        time.sleep(0.4)
+        while True:
+            set_motor_speed(-TURN_SPEED, TURN_SPEED)
+            if line_detected and 100 < current_cx < 220:
+                set_motor_speed(0, 0) 
+                time.sleep(0.15)
+                break 
+            time.sleep(0.02)
+            
+    elif action == "turn_right":
+        set_motor_speed(BASE_SPEED, BASE_SPEED)
+        time.sleep(0.5)
+        set_motor_speed(TURN_SPEED, -TURN_SPEED)
+        time.sleep(0.5)
+        while True:
+            set_motor_speed(TURN_SPEED, -TURN_SPEED)
+            if line_detected and 100 < current_cx < 220:
+                set_motor_speed(0, 0)
+                time.sleep(0.15)
+                break
+            time.sleep(0.02)
+    
+    is_maneuvering = False
+    robot_state = "running"
+
+# ==========================================
+# 3. Vision Thread
+# ==========================================
+app = Flask(__name__)
+latest_jpeg = None
+lock = threading.Lock()
+
+def run_camera_thread():
+    global latest_jpeg, robot_state, is_maneuvering, pending_turn, current_cx, line_detected
+    picam2 = Picamera2()
+    config = picam2.create_video_configuration(main={"size": (320, 320)})
+    picam2.configure(config)
+    picam2.set_controls({"AwbMode": 0})
+    picam2.start()
+    
+    last_error = 0
+    KP, KD = 0.65, 1.5 
+    historical_turn_direction = "straight"
+
+    while True:
+        request = picam2.capture_request()
+        frame = request.make_array("main")
+        request.release()
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        
+        mask_y = cv2.inRange(hsv, np.array([15, 70, 50]), np.array([40, 255, 255])) #range of yellow color using spectrum upper and lower
+        mask_r1 = cv2.inRange(hsv, np.array([0, 70, 50]), np.array([10, 255, 255]))
+        mask_r2 = cv2.inRange(hsv, np.array([160, 70, 50]), np.array([180, 255, 255]))
+        mask_shortcut = cv2.bitwise_or(mask_y, cv2.bitwise_or(mask_r1, mask_r2))# dont care it is yellow or red turn the color into white 
+        
+        roi_shortcut = mask_shortcut[80:320, :]#high start:stop
+        conts_s, _ = cv2.findContours(roi_shortcut, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE) #output show how 4 coordinate of rectangle edge
+        
+        thresh = None
+        if conts_s and cv2.contourArea(max(conts_s, key=cv2.contourArea)) > 200:
+            thresh = mask_shortcut
+        else:
+            thresh = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 80]))
+
+        roi = thresh[80:320, :]
+        contours, _ = cv2.findContours(roi, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            c = max(contours, key=cv2.contourArea)#c is contour coordinate
+            M = cv2.moments(c)
+            x, y, w, h = cv2.boundingRect(c) 
+            
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])#How many pixel you have / total of the pixel of x coordinate
+                current_cx = cx
+                line_detected = True
+
+                if pending_turn and w > 80 and not is_maneuvering:
+                    log_msg(f"\n[*] T-Junction Detected (Width: {w})! Firing {pending_turn}...")
+                    threading.Thread(target=execute_maneuver, args=(pending_turn,), daemon=True).start()
+                    pending_turn = None
+                    continue 
+
+                if not is_maneuvering and robot_state == "running":
+                    error = cx - 160
+                    if error > 40: historical_turn_direction = "right"
+                    elif error < -40: historical_turn_direction = "left"
+                    elif abs(error) < 15: historical_turn_direction = "straight"
+                        
+                    current_speed = BASE_SPEED
+                    if abs(error) > 60: current_speed = BASE_SPEED - 10 
+                        
+                    c
+                    last_error = error
+                    set_motor_speed(current_speed + correction, current_speed - correction)
+        else:
+            line_detected = False
+            if not is_maneuvering and robot_state == "running":
+                FAST_RECOVERY_SPEED = 50  
+                if historical_turn_direction == "right": set_motor_speed(FAST_RECOVERY_SPEED, -FAST_RECOVERY_SPEED)
+                elif historical_turn_direction == "left": set_motor_speed(-FAST_RECOVERY_SPEED, FAST_RECOVERY_SPEED)
+                else: set_motor_speed(BASE_SPEED - 5, BASE_SPEED - 5)
+
+        _, buffer = cv2.imencode('.jpg', frame_bgr)#grans a raw frame
+        with lock: latest_jpeg = buffer.tobytes()
+
+# ==========================================
+# 4. Flask Routes
+# ==========================================
+# ==========================================
+# 4. Flask Routes
+# ==========================================
+@app.route('/video_feed')#Streams the processed camera frames to your Mac using a "Multipart" response.
+def video_feed():
+    def generate():
+        while True:
+            with lock:
+                if latest_jpeg:
+                    # NEW: Calculate exact size of the image to prevent Mac OpenCV errors
+                    length = len(latest_jpeg)
+                    header = f"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {length}\r\n\r\n".encode()
+                    
+                    yield (header + latest_jpeg + b'\r\n')
+            time.sleep(0.04)
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/command/<action>')#Receives instructions like stop, spin_360, or turn_left from the Mac.
+def handle_command(action):
+    global robot_state, pending_turn, is_maneuvering
+    
+    if action == "running": 
+        robot_state = "running"
+        is_maneuvering = False
+        
+    elif action in ["turn_left", "turn_right"]:
+        pending_turn = action
+        log_msg(f"[*] Mac sent {action} -> Waiting for T-Junction...")
+        
+    elif not is_maneuvering:
+        threading.Thread(target=execute_maneuver, args=(action,), daemon=True).start()
+        
+    return f"Ok: {action}"
+
+# --- NEW: Route to fetch logs ---
+@app.route('/logs')#Allows the Mac to "drain" the pi_logs list so you can debug the Pi's status remotely.
+def get_logs():
+    global pi_logs
+    with lock:
+        logs_to_send = list(pi_logs)
+        pi_logs.clear() 
+    return Response(json.dumps({"logs": logs_to_send}), mimetype='application/json')
+
+if __name__ == '__main__':
+    threading.Thread(target=run_camera_thread, daemon=True).start()
+    app.run(host='0.0.0.0', port=5000, threaded=True)
