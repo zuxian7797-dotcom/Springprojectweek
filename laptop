@@ -1,0 +1,253 @@
+import cv2
+import threading
+import torch
+import time
+import requests
+from ultralytics import YOLO
+
+# ==========================================
+# 1. Configuration
+# ==========================================
+PI_IP = "172.20.10.2"
+PI_STREAM_URL = f"http://{PI_IP}:5000/video_feed"
+PI_COMMAND_URL = f"http://{PI_IP}:5000/command"
+
+CLASS_MAP = {
+    14: "stop",
+    5: "stop",
+    11: "spin_360",
+    2: "turn_left",
+    3: "turn_right",
+    4: "arrow_up"
+}
+
+MAX_SIZE_THRESHOLD = 0.90
+MIN_SIZE_THRESHOLD = 0.08
+
+class VideoStream:
+    def __init__(self, url):
+        self.cap = cv2.VideoCapture(url)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.grabbed, self.frame = self.cap.read()
+        self.stopped = False
+        self.new_frame_available = False
+        
+    def start(self):
+        threading.Thread(target=self.update, args=(), daemon=True).start()
+        return self
+
+    def update(self):
+        while not self.stopped:
+            grabbed, frame = self.cap.read()
+            if not grabbed: self.stop()
+            else:
+                self.frame = frame
+                self.new_frame_available = True
+
+    def read(self):
+        self.new_frame_available = False
+        return self.frame
+
+    def stop(self):
+        self.stopped = True
+        self.cap.release()
+
+def send_command_to_pi(action):
+    try:
+        requests.get(f"{PI_COMMAND_URL}/{action}", timeout=0.8)
+        print(f" >>> SUCCESS: Pi received '{action}'")
+    except Exception as e:
+        print(f" >>> FAILED: Could not reach Pi. {e}")
+
+# --- NEW: Fetch Pi Logs ---
+def fetch_pi_logs():
+    while True:
+        try:
+            response = requests.get(f"http://{PI_IP}:5000/logs", timeout=1.0)
+            if response.status_code == 200:
+                data = response.json()
+                for log in data.get("logs", []):
+                    print(f"[PI CAMERA BRAIN] {log}")
+        except Exception:
+            pass # Ignore connection errors if Pi isn't ready yet
+        time.sleep(0.5) # Check for new logs twice a second
+
+def main():
+    device = 'cpu'  # FORCE CPU TO FIX PYTORCH MAC CRASH
+    print(f"Using device: {device}")
+
+    print("Loading Original YOLO model...")
+    symbol_model = YOLO('/Users/yekzuxian/Downloads/0409/my_model/my_model.pt')
+    symbol_model.to(device)
+    
+    print("Loading Face Auth YOLO model...")
+    face_model = YOLO('/Users/yekzuxian/Downloads/my_model (17)/my_model.pt')
+    face_model.to(device)
+    
+    # Load OpenCV's built-in face detector fallback
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+    print(f"Connecting to Pi stream at {PI_STREAM_URL}...")
+    vs = VideoStream(PI_STREAM_URL).start()
+    time.sleep(1.0)
+    
+    # --- Start the background log fetcher ---
+    threading.Thread(target=fetch_pi_logs, daemon=True).start()
+    
+    current_pi_state = "running"
+    last_action_time = 0
+    ACTION_COOLDOWN = 3.5
+
+    action_buffer = []
+    REQUIRED_CONSECUTIVE_FRAMES = 3
+    
+    # State tracking for Face Authentication
+    face_auth_mode = False
+    auth_timeout_start = 0
+    face_successfully_matched = False
+    AUTH_DURATION = 10.0
+
+    while True:
+        if not vs.new_frame_available:
+            time.sleep(0.005)
+            continue
+
+        frame = vs.read()
+        if frame is None: continue
+        
+        frame = cv2.resize(frame, (320, 320))
+        display_frame = frame.copy()
+        
+        # ==========================================
+        # MODE 1: FACE AUTHENTICATION ACTIVE
+        # ==========================================
+        if face_auth_mode:
+            if current_pi_state != "stop_for_auth":
+                threading.Thread(target=send_command_to_pi, args=("stop_for_auth",), daemon=True).start()
+                current_pi_state = "stop_for_auth"
+
+            cv2.putText(display_frame, "AUTH MODE ACTIVE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            
+            results = face_model(frame, conf=0.85, imgsz=320, verbose=False)
+            yolo_detected_any_face = False
+
+            for r in results:
+                if len(r.boxes) > 0: yolo_detected_any_face = True
+                    
+                for box in r.boxes:
+                    class_name = r.names[int(box.cls[0])]
+                    # --- Print detected face ---
+                    print(f"[MAC AUTH] Detected: {class_name}")
+
+                    if class_name.lower() == "authorized_person":
+                        face_successfully_matched = True
+                        cv2.putText(display_frame, "MATCHED - WAITING...", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                display_frame = r.plot(img=display_frame)
+
+            if not yolo_detected_any_face:
+                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=7, minSize=(40, 40))
+                for (x, y, w, h) in faces:
+                    cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
+                    cv2.putText(display_frame, "UNKNOWN", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            if time.time() - auth_timeout_start > AUTH_DURATION:
+                if face_successfully_matched: print("\n -> AUTH COMPLETE. Resuming normal operations...")
+                else: print("\n -> AUTH FAILED. Resuming anyway...")
+                
+                threading.Thread(target=send_command_to_pi, args=("running",), daemon=True).start()
+                current_pi_state = "running"
+                last_action_time = time.time()
+                
+                face_auth_mode = False
+                face_successfully_matched = False
+                action_buffer.clear()
+                
+        # ==========================================
+        # MODE 2: NORMAL SYMBOL & ARROW DETECTION
+        # ==========================================
+        else:
+            yolo_frame = frame.copy()
+            cv2.rectangle(yolo_frame, (0, 0), (120, 35), (0, 0, 0), -1)
+            
+            results = symbol_model(yolo_frame, conf=0.40, imgsz=320, verbose=False)
+            
+            detected_action_this_frame = "running"
+            detected_label_this_frame = "None"
+
+            for r in results:
+                for box in r.boxes:
+                    class_id = int(box.cls[0])
+                    class_name = r.names[class_id]
+                    area_pct = (float(box.xywh[0][2]) * float(box.xywh[0][3])) / (320 * 320)
+
+                    # --- Print detected shape ---
+                    print(f"[MAC VISION] Detected Shape: {class_name} | Size: {area_pct:.2%}")
+
+                    if class_id in CLASS_MAP and MIN_SIZE_THRESHOLD < area_pct < MAX_SIZE_THRESHOLD:
+                        detected_action_this_frame = CLASS_MAP[class_id]
+                        detected_label_this_frame = class_name
+                        break
+                    elif class_name.lower() in ["fingerprint", "qr"] and area_pct < 0.90:
+                        detected_action_this_frame = "trigger_auth"
+                        detected_label_this_frame = class_name
+                        break
+
+            best_action = "running"
+            detected_label = "None"
+
+            if detected_action_this_frame != "running":
+                action_buffer.append((detected_action_this_frame, detected_label_this_frame))
+                if len(action_buffer) > REQUIRED_CONSECUTIVE_FRAMES:
+                    action_buffer.pop(0)
+                
+                if len(action_buffer) == REQUIRED_CONSECUTIVE_FRAMES:
+                    first_action = action_buffer[0][0]
+                    if all(act == first_action for act, lbl in action_buffer):
+                        best_action = first_action
+                        detected_label = action_buffer[0][1]
+            else:
+                action_buffer.clear()
+
+            now = time.time()
+            if best_action == "trigger_auth":
+                print(f"\n[!] TRIGGER: {detected_label} -> Switching to Face Auth Mode!")
+                face_auth_mode = True
+                auth_timeout_start = now
+                action_buffer.clear()
+                
+            elif best_action != "running":
+                if now - last_action_time > ACTION_COOLDOWN:
+                    print(f"\n[!] TRIGGER: {detected_label} -> Sending {best_action}")
+                    threading.Thread(target=send_command_to_pi, args=(best_action,), daemon=True).start()
+                    last_action_time = now
+                    current_pi_state = best_action
+                
+                elif best_action == "arrow_up" and current_pi_state in ["turn_left", "turn_right"]:
+                    print(f"\n[!] OVERRIDE: {detected_label} seen! Canceling accidental {current_pi_state}...")
+                    threading.Thread(target=send_command_to_pi, args=(best_action,), daemon=True).start()
+                    current_pi_state = best_action
+            
+            elif best_action == "running" and current_pi_state not in ["running", "arrow_up"]:
+                if now - last_action_time > 2.5:
+                    print("\n[+] Resuming line following...")
+                    send_command_to_pi("running")
+                    current_pi_state = "running"
+                    last_action_time = now
+
+            annotated_frame = results[0].plot(img=display_frame)
+            cv2.putText(annotated_frame, f"Pi State: {current_pi_state}", (10, 310),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            display_frame = annotated_frame
+
+        cv2.imshow("MacBrain YOLOv8 - Dual Model Controller", display_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            send_command_to_pi("stop")
+            break
+        
+    vs.stop()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
